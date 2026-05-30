@@ -429,6 +429,14 @@ export default function (pi: ExtensionAPI) {
 			.trim();
 	}
 
+	function getErrorMessage(error: unknown): string {
+		return error instanceof Error ? error.message : String(error);
+	}
+
+	function isTelegramMessageNotModifiedError(error: unknown): boolean {
+		return getErrorMessage(error).toLowerCase().includes("message is not modified");
+	}
+
 	async function clearPreview(chatId: number): Promise<void> {
 		const state = previewState;
 		if (!state) return;
@@ -451,8 +459,9 @@ export default function (pi: ExtensionAPI) {
 		if (!state) return;
 		state.flushTimer = undefined;
 		const text = state.pendingText.trim();
-		if (!text || text === state.lastSentText) return;
+		if (!text) return;
 		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
+		if (truncated === state.lastSentText) return;
 
 		if (draftSupport !== "unsupported") {
 			const draftId = state.draftId ?? allocateDraftId();
@@ -475,15 +484,22 @@ export default function (pi: ExtensionAPI) {
 			state.lastSentText = truncated;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		try {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		} catch (error) {
+			if (!isTelegramMessageNotModifiedError(error)) throw error;
+		}
 		state.mode = "message";
 		state.lastSentText = truncated;
 	}
 
-	function schedulePreviewFlush(chatId: number): void {
+	function schedulePreviewFlush(chatId: number, ctx: ExtensionContext): void {
 		if (!previewState || previewState.flushTimer) return;
 		previewState.flushTimer = setTimeout(() => {
-			void flushPreview(chatId);
+			void flushPreview(chatId).catch((error) => {
+				if (isTelegramMessageNotModifiedError(error)) return;
+				updateStatus(ctx, `preview failed: ${getErrorMessage(error)}`);
+			});
 		}, PREVIEW_THROTTLE_MS);
 	}
 
@@ -841,7 +857,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content);
+			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
 		}
 	}
 
@@ -1071,13 +1087,13 @@ export default function (pi: ExtensionAPI) {
 		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 	});
 
-	pi.on("message_update", async (event, _ctx) => {
+	pi.on("message_update", async (event, ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (!previewState) {
 			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 		}
 		previewState.pendingText = getMessageText(event.message);
-		schedulePreviewFlush(activeTelegramTurn.chatId);
+		schedulePreviewFlush(activeTelegramTurn.chatId, ctx);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -1124,7 +1140,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
+			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
 		}
 	});
 }
