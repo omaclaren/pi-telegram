@@ -295,7 +295,10 @@ export default function (pi: ExtensionAPI) {
 	let preserveQueuedTurnsAsHistory = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
-	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
+	// Telegram draft streaming can leave a ghost/blank draft bubble in some
+	// mobile clients and appears to interfere with outgoing message send state.
+	// Prefer the older sendMessage/editMessageText preview path by default.
+	let draftSupport: "unknown" | "supported" | "unsupported" = "unsupported";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 
