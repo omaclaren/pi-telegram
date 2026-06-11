@@ -157,6 +157,10 @@ const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
+// Disable streaming previews for now. The sendMessage/editMessageText preview
+// path can leave duplicate raw-preview + rendered-final messages, especially
+// for long replies. Final replies still render through Telegram HTML.
+const ENABLE_STREAMING_PREVIEW = false;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 
@@ -1206,7 +1210,9 @@ export default function (pi: ExtensionAPI) {
 			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 		}
 		previewState.pendingText = getMessageText(event.message);
-		schedulePreviewFlush(activeTelegramTurn.chatId, ctx);
+		if (ENABLE_STREAMING_PREVIEW) {
+			schedulePreviewFlush(activeTelegramTurn.chatId, ctx);
+		}
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -1235,8 +1241,8 @@ export default function (pi: ExtensionAPI) {
 
 		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
 			const finalized = await finalizePreview(turn.chatId);
-			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+			if (!finalized) {
+				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
 			}
 		} else {
 			await clearPreview(turn.chatId);
