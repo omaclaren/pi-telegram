@@ -212,8 +212,8 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
-function chunkParagraphs(text: string): string[] {
-	if (text.length <= MAX_MESSAGE_LENGTH) return [text];
+function chunkParagraphs(text: string, limit = MAX_MESSAGE_LENGTH): string[] {
+	if (text.length <= limit) return [text];
 
 	const normalized = text.replace(/\r\n/g, "\n");
 	const paragraphs = normalized.split(/\n\n+/);
@@ -226,13 +226,13 @@ function chunkParagraphs(text: string): string[] {
 	};
 
 	const splitLongBlock = (block: string): string[] => {
-		if (block.length <= MAX_MESSAGE_LENGTH) return [block];
+		if (block.length <= limit) return [block];
 		const lines = block.split("\n");
 		const lineChunks: string[] = [];
 		let lineCurrent = "";
 		for (const line of lines) {
 			const candidate = lineCurrent.length === 0 ? line : `${lineCurrent}\n${line}`;
-			if (candidate.length <= MAX_MESSAGE_LENGTH) {
+			if (candidate.length <= limit) {
 				lineCurrent = candidate;
 				continue;
 			}
@@ -240,12 +240,12 @@ function chunkParagraphs(text: string): string[] {
 				lineChunks.push(lineCurrent);
 				lineCurrent = "";
 			}
-			if (line.length <= MAX_MESSAGE_LENGTH) {
+			if (line.length <= limit) {
 				lineCurrent = line;
 				continue;
 			}
-			for (let i = 0; i < line.length; i += MAX_MESSAGE_LENGTH) {
-				lineChunks.push(line.slice(i, i + MAX_MESSAGE_LENGTH));
+			for (let i = 0; i < line.length; i += limit) {
+				lineChunks.push(line.slice(i, i + limit));
 			}
 		}
 		if (lineCurrent.length > 0) lineChunks.push(lineCurrent);
@@ -257,7 +257,7 @@ function chunkParagraphs(text: string): string[] {
 		const parts = splitLongBlock(paragraph);
 		for (const part of parts) {
 			const candidate = current.length === 0 ? part : `${current}\n\n${part}`;
-			if (candidate.length <= MAX_MESSAGE_LENGTH) {
+			if (candidate.length <= limit) {
 				current = candidate;
 			} else {
 				flushCurrent();
@@ -267,6 +267,76 @@ function chunkParagraphs(text: string): string[] {
 	}
 	flushCurrent();
 	return chunks;
+}
+
+function escapeTelegramHtml(text: string): string {
+	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderTelegramInlineMarkdown(text: string): string {
+	const placeholders: string[] = [];
+	let escaped = escapeTelegramHtml(text);
+	escaped = escaped.replace(/`([^`\n]+)`/g, (_match, code: string) => {
+		const token = `\u0000${placeholders.length}\u0000`;
+		placeholders.push(`<code>${code}</code>`);
+		return token;
+	});
+	escaped = escaped.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_match, label: string, url: string) => {
+		const safeUrl = url.replace(/"/g, "&quot;");
+		return `<a href="${safeUrl}">${label}</a>`;
+	});
+	escaped = escaped.replace(/\*\*([^*\n][\s\S]*?[^*\n])\*\*/g, "<b>$1</b>");
+	escaped = escaped.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<i>$1</i>");
+	for (let i = 0; i < placeholders.length; i++) {
+		const token = `\u0000${i}\u0000`;
+		escaped = escaped.split(token).join(placeholders[i]);
+	}
+	return escaped;
+}
+
+function renderTelegramMarkdown(text: string): string {
+	const normalized = text.replace(/\r\n/g, "\n");
+	const lines = normalized.split("\n");
+	const out: string[] = [];
+	let inFence = false;
+	let codeLines: string[] = [];
+
+	for (const line of lines) {
+		if (line.trimStart().startsWith("```")) {
+			if (inFence) {
+				out.push(`<pre><code>${escapeTelegramHtml(codeLines.join("\n"))}</code></pre>`);
+				codeLines = [];
+				inFence = false;
+			} else {
+				inFence = true;
+				codeLines = [];
+			}
+			continue;
+		}
+		if (inFence) {
+			codeLines.push(line);
+			continue;
+		}
+
+		const heading = /^(#{1,6})\s+(.+)$/.exec(line);
+		if (heading) {
+			out.push(`<b>${renderTelegramInlineMarkdown(heading[2])}</b>`);
+			continue;
+		}
+		const unordered = /^\s*[-*]\s+(.+)$/.exec(line);
+		if (unordered) {
+			out.push(`• ${renderTelegramInlineMarkdown(unordered[1])}`);
+			continue;
+		}
+		const ordered = /^\s*(\d+)\.\s+(.+)$/.exec(line);
+		if (ordered) {
+			out.push(`${ordered[1]}. ${renderTelegramInlineMarkdown(ordered[2])}`);
+			continue;
+		}
+		out.push(renderTelegramInlineMarkdown(line));
+	}
+	if (inFence) out.push(`<pre><code>${escapeTelegramHtml(codeLines.join("\n"))}</code></pre>`);
+	return out.join("\n").trim();
 }
 
 async function readConfig(): Promise<TelegramConfig> {
@@ -503,6 +573,45 @@ export default function (pi: ExtensionAPI) {
 		}, PREVIEW_THROTTLE_MS);
 	}
 
+	async function sendRenderedTelegramMessage(chatId: number, text: string): Promise<TelegramSentMessage> {
+		const rendered = renderTelegramMarkdown(text);
+		if (rendered.length > 0 && rendered.length <= MAX_MESSAGE_LENGTH) {
+			try {
+				return await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text: rendered,
+					parse_mode: "HTML",
+				});
+			} catch {
+				// Fall back to plain text if Telegram rejects the generated HTML.
+			}
+		}
+		return await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text });
+	}
+
+	async function editRenderedTelegramMessage(chatId: number, messageId: number, text: string): Promise<void> {
+		const rendered = renderTelegramMarkdown(text);
+		if (rendered.length > 0 && rendered.length <= MAX_MESSAGE_LENGTH) {
+			try {
+				await callTelegram("editMessageText", {
+					chat_id: chatId,
+					message_id: messageId,
+					text: rendered,
+					parse_mode: "HTML",
+				});
+				return;
+			} catch (error) {
+				if (isTelegramMessageNotModifiedError(error)) return;
+				// Fall back to plain text if Telegram rejects the generated HTML.
+			}
+		}
+		try {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text });
+		} catch (error) {
+			if (!isTelegramMessageNotModifiedError(error)) throw error;
+		}
+	}
+
 	async function finalizePreview(chatId: number): Promise<boolean> {
 		const state = previewState;
 		if (!state) return false;
@@ -513,22 +622,23 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await sendRenderedTelegramMessage(chatId, finalText);
 			await clearPreview(chatId);
 			return true;
 		}
 		previewState = undefined;
-		return state.messageId !== undefined;
+		if (state.messageId !== undefined) {
+			await editRenderedTelegramMessage(chatId, state.messageId, finalText);
+			return true;
+		}
+		return false;
 	}
 
 	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
-		const chunks = chunkParagraphs(text);
+		const chunks = chunkParagraphs(text, 3500);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-			});
+			const sent = await sendRenderedTelegramMessage(chatId, chunk);
 			lastMessageId = sent.message_id;
 		}
 		return lastMessageId;
