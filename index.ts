@@ -1,11 +1,11 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
-import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 interface TelegramConfig {
 	botToken?: string;
@@ -152,6 +152,7 @@ interface TelegramMediaGroupState {
 }
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
+const INBOUND_LOG_PATH = join(homedir(), ".pi", "agent", "telegram-inbound-log.md");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
@@ -171,6 +172,46 @@ Telegram bridge extension is active.
 - [telegram] messages may include local temp file paths for Telegram attachments. Read those files as needed.
 - If a [telegram] user asked for a file or generated artifact, use the telegram_attach tool with the local file path so the extension can send it with your next final reply.
 - Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.`;
+
+function trimLogValue(value: string, limit = 700): string {
+	const normalized = value.replace(/\s+/g, " ").trim();
+	return normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized;
+}
+
+function describeTelegramMessage(message: TelegramMessage): string {
+	const parts = [`message=${message.message_id}`, `chat=${message.chat.id}`, `chat_type=${message.chat.type}`];
+	if (message.from) parts.push(`from=${message.from.id}`);
+	const text = trimLogValue(message.text || message.caption || "");
+	if (text) parts.push(`text=${JSON.stringify(text)}`);
+	const attachmentTypes = [
+		message.photo ? "photo" : undefined,
+		message.document ? "document" : undefined,
+		message.video ? "video" : undefined,
+		message.audio ? "audio" : undefined,
+		message.voice ? "voice" : undefined,
+		message.animation ? "animation" : undefined,
+		message.sticker ? "sticker" : undefined,
+	].filter((type): type is string => Boolean(type));
+	if (attachmentTypes.length > 0) parts.push(`attachments=${attachmentTypes.join(",")}`);
+	if (message.media_group_id) parts.push(`media_group=${message.media_group_id}`);
+	return parts.join(" ");
+}
+
+function describeTelegramUpdate(update: TelegramUpdate): string {
+	const message = update.message || update.edited_message;
+	const updateType = update.edited_message ? "edited_message" : update.message ? "message" : "none";
+	return [`update=${update.update_id}`, `type=${updateType}`, message ? describeTelegramMessage(message) : "no_message"].join(" ");
+}
+
+async function appendInboundLog(status: string, details: string): Promise<void> {
+	try {
+		await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
+		const timestamp = new Date().toISOString();
+		await appendFile(INBOUND_LOG_PATH, `- ${timestamp} | ${status} | ${details}\n`, "utf8");
+	} catch {
+		// Logging should never break Telegram message handling.
+	}
+}
 
 function isTelegramPrompt(prompt: string): boolean {
 	return prompt.trimStart().startsWith(TELEGRAM_PREFIX);
@@ -369,6 +410,9 @@ export default function (pi: ExtensionAPI) {
 	let preserveQueuedTurnsAsHistory = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
+	let latestTelegramAssistant: AgentMessage | undefined;
+	let activeTelegramPromptStarted = false;
+	let pendingTelegramStartTurn: PendingTelegramTurn | undefined;
 	// Telegram draft streaming can leave a ghost/blank draft bubble in some
 	// mobile clients and appears to interfere with outgoing message send state.
 	// Prefer the older sendMessage/editMessageText preview path by default.
@@ -493,6 +537,18 @@ export default function (pi: ExtensionAPI) {
 
 	function isAssistantMessage(message: AgentMessage): boolean {
 		return (message as unknown as { role?: string }).role === "assistant";
+	}
+
+	function isUserMessage(message: AgentMessage): boolean {
+		return (message as unknown as { role?: string }).role === "user";
+	}
+
+	function getTelegramTurnPromptText(turn: PendingTelegramTurn): string {
+		return turn.content
+			.filter((block): block is TextContent => block.type === "text")
+			.map((block) => block.text)
+			.join("\n")
+			.trim();
 	}
 
 	function getMessageText(message: AgentMessage): string {
@@ -691,6 +747,114 @@ export default function (pi: ExtensionAPI) {
 		return {};
 	}
 
+	async function finalizeActiveTelegramTurn(ctx: ExtensionContext): Promise<void> {
+		const turn = activeTelegramTurn;
+		if (!turn) return;
+
+		const assistant = extractAssistantText(latestTelegramAssistant ? [latestTelegramAssistant] : []);
+		activeTelegramTurn = undefined;
+		latestTelegramAssistant = undefined;
+		activeTelegramPromptStarted = false;
+		currentAbort = undefined;
+		stopTypingLoop();
+		updateStatus(ctx);
+
+		if (assistant.stopReason === "aborted") {
+			await clearPreview(turn.chatId);
+			return;
+		}
+		if (assistant.stopReason === "error") {
+			// Reaching this function means Pi has exhausted automatic recovery for
+			// this prompt, or a later user prompt has begun.
+			await clearPreview(turn.chatId);
+			await sendTextReply(
+				turn.chatId,
+				turn.replyToMessageId,
+				assistant.errorMessage || "Telegram bridge: pi failed while processing the request.",
+			);
+			await appendInboundLog("reply_error", `chat=${turn.chatId} reply_to=${turn.replyToMessageId}`);
+			return;
+		}
+
+		const finalText = assistant.text;
+		if (previewState) {
+			previewState.pendingText = finalText ?? previewState.pendingText;
+		}
+
+		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
+			const finalized = await finalizePreview(turn.chatId);
+			if (!finalized) {
+				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+			}
+		} else {
+			await clearPreview(turn.chatId);
+			if (finalText) {
+				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+			} else if (turn.queuedAttachments.length > 0) {
+				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+			} else {
+				await sendTextReply(turn.chatId, turn.replyToMessageId, "Telegram bridge: pi finished without a final response.");
+			}
+		}
+
+		await sendQueuedAttachments(turn);
+		await appendInboundLog(
+			"reply_sent",
+			`chat=${turn.chatId} reply_to=${turn.replyToMessageId} attachments=${turn.queuedAttachments.length}`,
+		);
+	}
+
+	function removeQueuedTelegramTurn(turn: PendingTelegramTurn): void {
+		const index = queuedTelegramTurns.indexOf(turn);
+		if (index >= 0) queuedTelegramTurns.splice(index, 1);
+	}
+
+	async function reportTelegramStartFailure(
+		turn: PendingTelegramTurn,
+		ctx: ExtensionContext,
+		reason: string,
+	): Promise<void> {
+		removeQueuedTelegramTurn(turn);
+		if (pendingTelegramStartTurn === turn) pendingTelegramStartTurn = undefined;
+		stopTypingLoop();
+		updateStatus(ctx);
+		await sendTextReply(turn.chatId, turn.replyToMessageId, `Telegram bridge could not start pi: ${reason}`);
+		await appendInboundLog(
+			"start_failed",
+			`chat=${turn.chatId} reply_to=${turn.replyToMessageId} error=${JSON.stringify(reason)}`,
+		);
+	}
+
+	async function forwardNextQueuedTelegramTurn(ctx: ExtensionContext): Promise<void> {
+		if (activeTelegramTurn || pendingTelegramStartTurn || preserveQueuedTurnsAsHistory || !ctx.isIdle()) return;
+
+		while (queuedTelegramTurns.length > 0) {
+			const turn = queuedTelegramTurns[0];
+			if (!ctx.model) {
+				await reportTelegramStartFailure(turn, ctx, "no model is selected");
+				continue;
+			}
+
+			try {
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+				if (!auth.ok) {
+					await reportTelegramStartFailure(turn, ctx, auth.error);
+					continue;
+				}
+			} catch (error) {
+				await reportTelegramStartFailure(turn, ctx, getErrorMessage(error));
+				continue;
+			}
+
+			pendingTelegramStartTurn = turn;
+			startTypingLoop(ctx, turn.chatId);
+			updateStatus(ctx);
+			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+			await appendInboundLog("forwarded", `chat=${turn.chatId} reply_to=${turn.replyToMessageId} deliverAs=followUp`);
+			return;
+		}
+	}
+
 	function collectTelegramFileInfos(messages: TelegramMessage[]): TelegramFileInfo[] {
 		const files: TelegramFileInfo[] = [];
 		for (const message of messages) {
@@ -871,6 +1035,7 @@ export default function (pi: ExtensionAPI) {
 	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext): Promise<void> {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
+		await appendInboundLog("dispatching", `count=${messages.length} ${describeTelegramMessage(firstMessage)}`);
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
 		const lower = rawText.toLowerCase();
 
@@ -882,8 +1047,10 @@ export default function (pi: ExtensionAPI) {
 				currentAbort();
 				updateStatus(ctx);
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Aborted current turn.");
+				await appendInboundLog("command_stop", `${describeTelegramMessage(firstMessage)} result=aborted`);
 			} else {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "No active turn.");
+				await appendInboundLog("command_stop", `${describeTelegramMessage(firstMessage)} result=no_active_turn`);
 			}
 			return;
 		}
@@ -891,6 +1058,7 @@ export default function (pi: ExtensionAPI) {
 		if (lower === "/compact") {
 			if (!ctx.isIdle()) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
+				await appendInboundLog("command_compact", `${describeTelegramMessage(firstMessage)} result=busy`);
 				return;
 			}
 			ctx.compact({
@@ -903,6 +1071,7 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
+			await appendInboundLog("command_compact", `${describeTelegramMessage(firstMessage)} result=started`);
 			return;
 		}
 
@@ -927,6 +1096,9 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.model) {
 				lines.push(`Model: ${ctx.model.provider}/${ctx.model.id}`);
 			}
+			lines.push(`Telegram last update: ${config.lastUpdateId ?? "unknown"}`);
+			lines.push(`Queued Telegram turns: ${queuedTelegramTurns.length}${activeTelegramTurn ? " (+active)" : ""}`);
+			lines.push(`Inbound log: ${INBOUND_LOG_PATH}`);
 			const tokenParts: string[] = [];
 			if (totalInput) tokenParts.push(`↑${formatTokens(totalInput)}`);
 			if (totalOutput) tokenParts.push(`↓${formatTokens(totalOutput)}`);
@@ -950,6 +1122,7 @@ export default function (pi: ExtensionAPI) {
 				lines.push("No usage data yet.");
 			}
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, lines.join("\n"));
+			await appendInboundLog("command_status", `${describeTelegramMessage(firstMessage)} result=sent`);
 			return;
 		}
 
@@ -963,7 +1136,9 @@ export default function (pi: ExtensionAPI) {
 				config.allowedUserId = firstMessage.from.id;
 				await writeConfig(config);
 				updateStatus(ctx);
+				await appendInboundLog("paired", `${describeTelegramMessage(firstMessage)} user=${firstMessage.from.id}`);
 			}
+			await appendInboundLog("command_help", `${describeTelegramMessage(firstMessage)} result=sent`);
 			return;
 		}
 
@@ -971,10 +1146,9 @@ export default function (pi: ExtensionAPI) {
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns);
 		queuedTelegramTurns.push(turn);
+		await appendInboundLog("queued", `${describeTelegramMessage(firstMessage)} queue=${queuedTelegramTurns.length} idle=${ctx.isIdle()}`);
 		if (ctx.isIdle()) {
-			startTypingLoop(ctx, turn.chatId);
-			updateStatus(ctx);
-			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+			await forwardNextQueuedTelegramTurn(ctx);
 		}
 	}
 
@@ -983,12 +1157,16 @@ export default function (pi: ExtensionAPI) {
 			const key = `${message.chat.id}:${message.media_group_id}`;
 			const existing = mediaGroups.get(key) ?? { messages: [] };
 			existing.messages.push(message);
+			await appendInboundLog("media_group_buffered", `${describeTelegramMessage(message)} group_count=${existing.messages.length}`);
 			if (existing.flushTimer) clearTimeout(existing.flushTimer);
 			existing.flushTimer = setTimeout(() => {
 				const state = mediaGroups.get(key);
 				mediaGroups.delete(key);
 				if (!state) return;
-				void dispatchAuthorizedTelegramMessages(state.messages, ctx);
+				void dispatchAuthorizedTelegramMessages(state.messages, ctx).catch((error) => {
+					const errorMessage = error instanceof Error ? error.message : String(error);
+					void appendInboundLog("errored", `media_group=${key} dispatch_error=${JSON.stringify(errorMessage)}`);
+				});
 			}, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
 			mediaGroups.set(key, existing);
 			return;
@@ -999,20 +1177,38 @@ export default function (pi: ExtensionAPI) {
 
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
 		const message = update.message || update.edited_message;
-		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
+		if (!message) {
+			await appendInboundLog("ignored", `${describeTelegramUpdate(update)} reason=no_message`);
+			return;
+		}
+		if (message.chat.type !== "private") {
+			await appendInboundLog("ignored", `${describeTelegramUpdate(update)} reason=non_private_chat`);
+			return;
+		}
+		if (!message.from) {
+			await appendInboundLog("ignored", `${describeTelegramUpdate(update)} reason=missing_sender`);
+			return;
+		}
+		if (message.from.is_bot) {
+			await appendInboundLog("ignored", `${describeTelegramUpdate(update)} reason=bot_sender`);
+			return;
+		}
 
 		if (config.allowedUserId === undefined) {
 			config.allowedUserId = message.from.id;
 			await writeConfig(config);
 			updateStatus(ctx);
 			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
+			await appendInboundLog("paired", `${describeTelegramUpdate(update)} user=${message.from.id}`);
 		}
 
 		if (message.from.id !== config.allowedUserId) {
 			await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
+			await appendInboundLog("unauthorized", `${describeTelegramUpdate(update)} allowed=${config.allowedUserId}`);
 			return;
 		}
 
+		await appendInboundLog("authorized", describeTelegramUpdate(update));
 		await handleAuthorizedTelegramMessage(message, ctx);
 	}
 
@@ -1051,9 +1247,17 @@ export default function (pi: ExtensionAPI) {
 					{ signal },
 				);
 				for (const update of updates) {
-					config.lastUpdateId = update.update_id;
-					await writeConfig(config);
-					await handleUpdate(update, ctx);
+					await appendInboundLog("received", describeTelegramUpdate(update));
+					try {
+						await handleUpdate(update, ctx);
+						config.lastUpdateId = update.update_id;
+						await writeConfig(config);
+						await appendInboundLog("acknowledged", describeTelegramUpdate(update));
+					} catch (error) {
+						const errorMessage = error instanceof Error ? error.message : String(error);
+						await appendInboundLog("errored", `${describeTelegramUpdate(update)} error=${JSON.stringify(errorMessage)}`);
+						throw error;
+					}
 				}
 			} catch (error) {
 				if (signal.aborted) return;
@@ -1159,6 +1363,16 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx);
 	});
 
+	pi.on("session_compact", async (_event, ctx) => {
+		// Manual compaction does not emit agent_settled. Retry queued Telegram
+		// delivery after the completed compaction handler returns to Pi.
+		setTimeout(() => {
+			void forwardNextQueuedTelegramTurn(ctx).catch((error) => {
+				void appendInboundLog("errored", `post_compact_forward=${JSON.stringify(getErrorMessage(error))}`);
+			});
+		}, 0);
+	});
+
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
 		for (const state of mediaGroups.values()) {
@@ -1169,6 +1383,9 @@ export default function (pi: ExtensionAPI) {
 			await clearPreview(activeTelegramTurn.chatId);
 		}
 		activeTelegramTurn = undefined;
+		latestTelegramAssistant = undefined;
+		activeTelegramPromptStarted = false;
+		pendingTelegramStartTurn = undefined;
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
 		await stopPolling();
@@ -1185,21 +1402,49 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		currentAbort = () => ctx.abort();
-		if (!activeTelegramTurn && queuedTelegramTurns.length > 0) {
-			const nextTurn = queuedTelegramTurns.shift();
-			if (nextTurn) {
-				activeTelegramTurn = { ...nextTurn };
-				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
-				startTypingLoop(ctx);
-			}
-		}
 		updateStatus(ctx);
 	});
 
-	pi.on("message_start", async (event, _ctx) => {
-		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
-		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
-			await finalizePreview(activeTelegramTurn.chatId);
+	pi.on("message_start", async (event, ctx) => {
+		if (isUserMessage(event.message) && !activeTelegramTurn && pendingTelegramStartTurn) {
+			const pendingTurn = pendingTelegramStartTurn;
+			if (getMessageText(event.message) === getTelegramTurnPromptText(pendingTurn)) {
+				// Correlate on the actual user message, not merely the next agent_start:
+				// a local prompt can race with the fire-and-forget sendUserMessage call.
+				removeQueuedTelegramTurn(pendingTurn);
+				pendingTelegramStartTurn = undefined;
+				activeTelegramTurn = { ...pendingTurn };
+				latestTelegramAssistant = undefined;
+				activeTelegramPromptStarted = false;
+				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+				startTypingLoop(ctx);
+				updateStatus(ctx);
+			}
+		}
+
+		if (!activeTelegramTurn) return;
+
+		if (isUserMessage(event.message)) {
+			if (!activeTelegramPromptStarted) {
+				activeTelegramPromptStarted = true;
+				return;
+			}
+			// Pi can process unrelated queued user messages before agent_settled.
+			// Close the Telegram turn at that user-message boundary so a later local
+			// continuation cannot be misattributed as Telegram's reply.
+			await finalizeActiveTelegramTurn(ctx);
+			return;
+		}
+
+		if (!isAssistantMessage(event.message)) return;
+		if (ENABLE_STREAMING_PREVIEW) {
+			if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
+				await finalizePreview(activeTelegramTurn.chatId);
+			}
+		} else {
+			// Do not expose intermediate assistant messages (including transient
+			// provider errors) when Telegram streaming previews are disabled.
+			await clearPreview(activeTelegramTurn.chatId);
 		}
 		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 	});
@@ -1215,51 +1460,17 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("agent_end", async (event, ctx) => {
-		const turn = activeTelegramTurn;
+	pi.on("message_end", async (event, _ctx) => {
+		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
+		latestTelegramAssistant = event.message;
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
 		currentAbort = undefined;
-		stopTypingLoop();
-		activeTelegramTurn = undefined;
-		updateStatus(ctx);
-		if (!turn) return;
+		await finalizeActiveTelegramTurn(ctx);
 
-		const assistant = extractAssistantText(event.messages);
-		if (assistant.stopReason === "aborted") {
-			await clearPreview(turn.chatId);
-			return;
-		}
-		if (assistant.stopReason === "error") {
-			await clearPreview(turn.chatId);
-			await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
-			return;
-		}
-
-		const finalText = assistant.text;
-		if (previewState) {
-			previewState.pendingText = finalText ?? previewState.pendingText;
-		}
-
-		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
-			const finalized = await finalizePreview(turn.chatId);
-			if (!finalized) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
-			}
-		} else {
-			await clearPreview(turn.chatId);
-			if (finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
-			} else if (turn.queuedAttachments.length > 0) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
-			}
-		}
-
-		await sendQueuedAttachments(turn);
-
-		if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
-			const nextTurn = queuedTelegramTurns[0];
-			startTypingLoop(ctx, nextTurn.chatId);
-			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
-		}
+		// This also starts a Telegram turn that arrived while a local Pi turn was
+		// busy, which the old agent_end-only flow could leave stranded.
+		await forwardNextQueuedTelegramTurn(ctx);
 	});
 }

@@ -121,11 +121,11 @@ That aborts the active pi turn.
 
 If you send more Telegram messages while pi is busy, they are queued and processed in order.
 
-## Streaming
+## Replies and recovery
 
-The extension streams assistant text previews back to Telegram while pi is generating.
+Streaming previews are currently disabled. The extension waits until Pi has settled before sending the final Telegram reply, so transient provider errors, automatic retries, and compaction recovery are not exposed as terminal Telegram errors.
 
-It tries Telegram draft streaming first with `sendMessageDraft`. If that is not supported for your bot, it falls back to `sendMessage` plus `editMessageText`.
+A genuine terminal error is sent only after Pi has exhausted automatic recovery. Requested attachments remain queued across retries and are sent with the final successful reply.
 
 ## Notes
 

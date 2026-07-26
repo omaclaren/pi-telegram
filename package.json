@@ -4,7 +4,16 @@
   "private": false,
   "description": "Telegram DM bridge extension for pi",
   "type": "module",
-  "keywords": ["pi-package", "pi", "telegram", "bot", "extension"],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "telegram",
+    "bot",
+    "extension"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,12 +24,21 @@
     "url": "https://github.com/badlogic/pi-telegram/issues"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-agent-core": ">=0.80.6",
+    "@earendil-works/pi-ai": ">=0.80.6",
+    "@earendil-works/pi-coding-agent": ">=0.80.6",
+    "typebox": ">=1.1.38"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.82.1",
+    "@earendil-works/pi-ai": "0.82.1",
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "typebox": "1.1.38",
+    "typescript": "7.0.2"
   }
 }
