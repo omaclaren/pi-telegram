@@ -121,6 +121,12 @@ That aborts the active pi turn.
 
 If you send more Telegram messages while pi is busy, they are queued and processed in order.
 
+### Reply to an earlier bot message
+
+Use Telegram's normal **Reply** action on a bot message, then send a short response such as `hint` or a longer comment. The bridge includes the replied-to message in a clearly marked context block for Pi, so scheduled digests and other bot messages remain understandable even though they were sent outside the current Pi conversation.
+
+Pi's first response chunk quotes your Telegram message, keeping the exchange visually grouped in the DM.
+
 ## Replies and recovery
 
 Streaming previews are currently disabled. The extension waits until Pi has settled before sending the final Telegram reply, so transient provider errors, automatic retries, and compaction recovery are not exposed as terminal Telegram errors.
@@ -130,7 +136,7 @@ A genuine terminal error is sent only after Pi has exhausted automatic recovery.
 ## Notes
 
 - Only one pi session should be connected to the bot at a time
-- Replies are sent as normal Telegram messages, not quote-replies
+- Reply text and returned attachments quote the originating Telegram message when it is still available
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`
 
